@@ -1,10 +1,11 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { logs } from "@opentelemetry/api-logs"
-import { trace } from "@opentelemetry/api"
+import { SpanStatusCode, trace } from "@opentelemetry/api"
 import pkg from "../package.json" with { type: "json" }
 import type {
   EventSessionCreated,
+  EventSessionDeleted,
   EventSessionIdle,
   EventSessionError,
   EventSessionStatus,
@@ -19,7 +20,7 @@ import { LEVELS, type Level, type HandlerContext } from "./types.ts"
 import { loadConfig, resolveLogLevel } from "./config.ts"
 import { probeEndpoint } from "./probe.ts"
 import { setupOtel, createInstruments } from "./otel.ts"
-import { handleSessionCreated, handleSessionIdle, handleSessionError, handleSessionStatus } from "./handlers/session.ts"
+import { handleSessionCreated, handleSessionDeleted, handleSessionIdle, handleSessionError, handleSessionStatus } from "./handlers/session.ts"
 import { handleMessageUpdated, handleMessagePartUpdated, startMessageSpan } from "./handlers/message.ts"
 import { handlePermissionUpdated, handlePermissionReplied } from "./handlers/permission.ts"
 import { handleSessionDiff, handleCommandExecuted } from "./handlers/activity.ts"
@@ -111,7 +112,38 @@ export const OtelPlugin: Plugin = async ({ project, client }) => {
     messageSpans,
   }
 
+  function closeOpenSpans() {
+    for (const [key, pending] of pendingToolSpans) {
+      pending.span?.setStatus({ code: SpanStatusCode.ERROR, message: "process shutdown before tool completed" })
+      pending.span?.end()
+      pendingToolSpans.delete(key)
+    }
+
+    for (const [key, span] of messageSpans) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: "process shutdown before message completed" })
+      span.end()
+      messageSpans.delete(key)
+    }
+
+    for (const [sessionID, span] of sessionSpans) {
+      const totals = sessionTotals.get(sessionID)
+      if (totals) {
+        span.setAttributes({
+          "session.total_tokens": totals.tokens,
+          "session.total_cost_usd": totals.cost,
+          "session.total_messages": totals.messages,
+        })
+      }
+      span.setStatus({ code: SpanStatusCode.OK })
+      span.end()
+      sessionSpans.delete(sessionID)
+    }
+
+    sessionTotals.clear()
+  }
+
   async function shutdown() {
+    closeOpenSpans()
     await Promise.allSettled([meterProvider.shutdown(), loggerProvider.shutdown(), tracerProvider.shutdown()])
   }
 
@@ -181,6 +213,9 @@ export const OtelPlugin: Plugin = async ({ project, client }) => {
           break
         case "session.idle":
           handleSessionIdle(event as EventSessionIdle, ctx)
+          break
+        case "session.deleted":
+          handleSessionDeleted(event as EventSessionDeleted, ctx)
           break
         case "session.error":
           handleSessionError(event as EventSessionError, ctx)

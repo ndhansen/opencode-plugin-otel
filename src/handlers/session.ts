@@ -1,6 +1,6 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanStatusCode, context, trace } from "@opentelemetry/api"
-import type { EventSessionCreated, EventSessionIdle, EventSessionError, EventSessionStatus } from "@opencode-ai/sdk"
+import type { EventSessionCreated, EventSessionDeleted, EventSessionIdle, EventSessionError, EventSessionStatus } from "@opencode-ai/sdk"
 import { errorSummary, setBoundedMap, isMetricEnabled, isTraceEnabled } from "../util.ts"
 import type { HandlerContext } from "../types.ts"
 
@@ -71,11 +71,38 @@ function sweepSession(sessionID: string, ctx: HandlerContext) {
   }
 }
 
-/** Emits a `session.idle` log event, records duration and session total histograms, ends the session span, and clears pending state. */
+function setSessionSpanTotals(sessionID: string, ctx: HandlerContext) {
+  const totals = ctx.sessionTotals.get(sessionID)
+  const sessionSpan = ctx.sessionSpans.get(sessionID)
+  if (!totals || !sessionSpan) return totals
+
+  sessionSpan.setAttributes({
+    "session.total_tokens": totals.tokens,
+    "session.total_cost_usd": totals.cost,
+    "session.total_messages": totals.messages,
+  })
+
+  return totals
+}
+
+function finalizeSession(sessionID: string, status: { code: SpanStatusCode; message?: string }, ctx: HandlerContext) {
+  sweepSession(sessionID, ctx)
+  const totals = setSessionSpanTotals(sessionID, ctx) ?? ctx.sessionTotals.get(sessionID)
+  ctx.sessionTotals.delete(sessionID)
+
+  const sessionSpan = ctx.sessionSpans.get(sessionID)
+  if (!sessionSpan) return totals
+
+  sessionSpan.setStatus(status)
+  sessionSpan.end()
+  ctx.sessionSpans.delete(sessionID)
+  return totals
+}
+
+/** Emits a `session.idle` log event, records duration and session total histograms, and clears pending state. */
 export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
   const sessionID = e.properties.sessionID
   const totals = ctx.sessionTotals.get(sessionID)
-  ctx.sessionTotals.delete(sessionID)
   sweepSession(sessionID, ctx)
 
   const attrs = { ...ctx.commonAttrs, "session.id": sessionID }
@@ -94,19 +121,7 @@ export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
     }
   }
 
-  const sessionSpan = ctx.sessionSpans.get(sessionID)
-  if (sessionSpan) {
-    if (totals) {
-      sessionSpan.setAttributes({
-        "session.total_tokens": totals.tokens,
-        "session.total_cost_usd": totals.cost,
-        "session.total_messages": totals.messages,
-      })
-    }
-    sessionSpan.setStatus({ code: SpanStatusCode.OK })
-    sessionSpan.end()
-    ctx.sessionSpans.delete(sessionID)
-  }
+  setSessionSpanTotals(sessionID, ctx)
 
   ctx.logger.emit({
     severityNumber: SeverityNumber.INFO,
@@ -129,22 +144,26 @@ export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
   })
 }
 
+export function handleSessionDeleted(e: EventSessionDeleted, ctx: HandlerContext) {
+  const sessionID = "sessionID" in e.properties && typeof e.properties.sessionID === "string"
+    ? e.properties.sessionID
+    : e.properties.info.id
+  finalizeSession(sessionID, { code: SpanStatusCode.OK }, ctx)
+  ctx.log("debug", "otel: session.deleted", { sessionID })
+}
+
 /** Emits a `session.error` log event, ends the session span with error status, and clears any pending state for the session. */
 export function handleSessionError(e: EventSessionError, ctx: HandlerContext) {
   const rawID = e.properties.sessionID
   const sessionID = rawID ?? "unknown"
   const error = errorSummary(e.properties.error)
-  if (rawID) ctx.sessionTotals.delete(rawID)
-  sweepSession(sessionID, ctx)
 
   if (rawID) {
     const sessionSpan = ctx.sessionSpans.get(rawID)
-    if (sessionSpan) {
-      sessionSpan.setStatus({ code: SpanStatusCode.ERROR, message: error })
-      sessionSpan.setAttribute("error", error)
-      sessionSpan.end()
-      ctx.sessionSpans.delete(rawID)
-    }
+    sessionSpan?.setAttribute("error", error)
+    finalizeSession(rawID, { code: SpanStatusCode.ERROR, message: error }, ctx)
+  } else {
+    sweepSession(sessionID, ctx)
   }
 
   ctx.logger.emit({

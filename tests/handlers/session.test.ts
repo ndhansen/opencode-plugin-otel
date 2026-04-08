@@ -1,7 +1,8 @@
 import { describe, test, expect } from "bun:test"
-import { handleSessionCreated, handleSessionIdle, handleSessionError, handleSessionStatus } from "../../src/handlers/session.ts"
+import { handleSessionCreated, handleSessionDeleted, handleSessionIdle, handleSessionError, handleSessionStatus } from "../../src/handlers/session.ts"
+import { handleMessageUpdated } from "../../src/handlers/message.ts"
 import { makeCtx, makeTracer } from "../helpers.ts"
-import type { EventSessionCreated, EventSessionIdle, EventSessionError, EventSessionStatus } from "@opencode-ai/sdk"
+import type { EventMessageUpdated, EventSessionCreated, EventSessionDeleted, EventSessionIdle, EventSessionError, EventSessionStatus } from "@opencode-ai/sdk"
 import type { Span } from "@opentelemetry/api"
 
 function makeSessionCreated(sessionID: string, createdAt = 1000, parentID?: string): EventSessionCreated {
@@ -23,6 +24,13 @@ function makeSessionIdle(sessionID: string): EventSessionIdle {
   return { type: "session.idle", properties: { sessionID } } as EventSessionIdle
 }
 
+function makeSessionDeleted(sessionID: string): EventSessionDeleted {
+  return {
+    type: "session.deleted",
+    properties: { info: { id: sessionID } },
+  } as unknown as EventSessionDeleted
+}
+
 function makeSessionError(sessionID: string, error?: { name: string }): EventSessionError {
   return {
     type: "session.error",
@@ -32,6 +40,30 @@ function makeSessionError(sessionID: string, error?: { name: string }): EventSes
 
 function makeSessionStatus(sessionID: string, status: { type: "retry"; attempt: number; message: string; next: number } | { type: "busy" } | { type: "idle" }): EventSessionStatus {
   return { type: "session.status", properties: { sessionID, status } } as unknown as EventSessionStatus
+}
+
+function makeAssistantMessageUpdated(overrides: {
+  id?: string
+  sessionID?: string
+  cost?: number
+  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+  time?: { created: number; completed: number }
+} = {}): EventMessageUpdated {
+  return {
+    type: "message.updated",
+    properties: {
+      info: {
+        id: overrides.id ?? "msg_1",
+        role: "assistant",
+        sessionID: overrides.sessionID ?? "ses_1",
+        modelID: "claude-3-5-sonnet",
+        providerID: "anthropic",
+        cost: overrides.cost ?? 0.01,
+        tokens: overrides.tokens ?? { input: 100, output: 50, reasoning: 0, cache: { read: 10, write: 5 } },
+        time: overrides.time ?? { created: 1000, completed: 2000 },
+      },
+    },
+  } as unknown as EventMessageUpdated
 }
 
 describe("handleSessionCreated", () => {
@@ -151,11 +183,62 @@ describe("handleSessionIdle", () => {
     expect(gauges.sessionCost.calls).toHaveLength(0)
   })
 
-  test("removes sessionTotals entry on idle", async () => {
+  test("preserves sessionTotals entry on idle", async () => {
     const { ctx } = makeCtx()
     await handleSessionCreated(makeSessionCreated("ses_1"), ctx)
     expect(ctx.sessionTotals.has("ses_1")).toBe(true)
     handleSessionIdle(makeSessionIdle("ses_1"), ctx)
+    expect(ctx.sessionTotals.has("ses_1")).toBe(true)
+  })
+
+  test("keeps accumulating totals across later turns after idle", async () => {
+    const { ctx, histograms, gauges } = makeCtx()
+    const originalNow = Date.now
+    let now = 2000
+    Date.now = () => now
+
+    try {
+      await handleSessionCreated(makeSessionCreated("ses_1", 1000), ctx)
+
+      await handleMessageUpdated(
+        makeAssistantMessageUpdated({
+          id: "msg_1",
+          sessionID: "ses_1",
+          cost: 0.02,
+          tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 20, write: 5 } },
+        }),
+        ctx,
+      )
+      handleSessionIdle(makeSessionIdle("ses_1"), ctx)
+
+      now = 3000
+
+      await handleMessageUpdated(
+        makeAssistantMessageUpdated({
+          id: "msg_2",
+          sessionID: "ses_1",
+          cost: 0.03,
+          tokens: { input: 60, output: 50, reasoning: 10, cache: { read: 5, write: 0 } },
+        }),
+        ctx,
+      )
+      handleSessionIdle(makeSessionIdle("ses_1"), ctx)
+    } finally {
+      Date.now = originalNow
+    }
+
+    expect(histograms.sessionDuration.calls.map((call) => call.value)).toEqual([1000, 2000])
+    expect(gauges.sessionToken.calls.map((call) => call.value)).toEqual([185, 310])
+    expect(gauges.sessionCost.calls.map((call) => call.value)).toEqual([0.02, 0.05])
+    expect(ctx.sessionTotals.get("ses_1")).toEqual({ startMs: 1000, tokens: 310, cost: 0.05, messages: 2, agent: "unknown" })
+  })
+})
+
+describe("handleSessionDeleted", () => {
+  test("removes sessionTotals entry on delete", async () => {
+    const { ctx } = makeCtx()
+    await handleSessionCreated(makeSessionCreated("ses_1"), ctx)
+    handleSessionDeleted(makeSessionDeleted("ses_1"), ctx)
     expect(ctx.sessionTotals.has("ses_1")).toBe(false)
   })
 })

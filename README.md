@@ -34,10 +34,10 @@ An [opencode](https://opencode.ai) plugin that exports telemetry via OpenTelemet
 | `opencode.commit.count` | Counter | Git commits detected via bash tool |
 | `opencode.tool.duration` | Histogram | Tool execution time in milliseconds |
 | `opencode.cache.count` | Counter | Cache activity per message: `type=cacheRead` or `type=cacheCreation` |
-| `opencode.session.duration` | Histogram | Session duration from created to idle in milliseconds |
+| `opencode.session.duration` | Histogram | Cumulative session duration from creation to each idle point, in milliseconds |
 | `opencode.message.count` | Counter | Completed assistant messages per session |
-| `opencode.session.token.total` | Histogram | Total tokens consumed per session, recorded on idle |
-| `opencode.session.cost.total` | Histogram | Total cost per session in USD, recorded on idle |
+| `opencode.session.token.total` | Histogram | Cumulative total tokens consumed per session, recorded each time the session goes idle |
+| `opencode.session.cost.total` | Histogram | Cumulative total cost per session in USD, recorded each time the session goes idle |
 | `opencode.model.usage` | Counter | Messages per model and provider |
 | `opencode.retry.count` | Counter | API retries observed via `session.status` events |
 
@@ -46,7 +46,7 @@ An [opencode](https://opencode.ai) plugin that exports telemetry via OpenTelemet
 | Event | Description |
 |-------|-------------|
 | `session.created` | Session started |
-| `session.idle` | Session went idle (includes total tokens, cost, messages) |
+| `session.idle` | Session went idle (includes cumulative tokens, cost, messages so far) |
 | `session.error` | Session error |
 | `user_prompt` | User sent a message (includes `prompt_length`, `model`, `agent`) |
 | `api_request` | Completed assistant message (tokens, cost, duration) |

@@ -1,11 +1,12 @@
 import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
 import type { Span } from "@opentelemetry/api"
-import { handleSessionCreated, handleSessionIdle, handleSessionError } from "../../src/handlers/session.ts"
+import { handleSessionCreated, handleSessionDeleted, handleSessionIdle, handleSessionError } from "../../src/handlers/session.ts"
 import { handleMessageUpdated, handleMessagePartUpdated, startMessageSpan } from "../../src/handlers/message.ts"
 import { makeCtx, makeTracer, type SpySpan } from "../helpers.ts"
 import type {
   EventSessionCreated,
+  EventSessionDeleted,
   EventSessionIdle,
   EventSessionError,
   EventMessageUpdated,
@@ -21,6 +22,13 @@ function makeSessionCreated(sessionID: string, createdAt = 1000, parentID?: stri
 
 function makeSessionIdle(sessionID: string): EventSessionIdle {
   return { type: "session.idle", properties: { sessionID } } as EventSessionIdle
+}
+
+function makeSessionDeleted(sessionID: string): EventSessionDeleted {
+  return {
+    type: "session.deleted",
+    properties: { info: { id: sessionID } },
+  } as unknown as EventSessionDeleted
 }
 
 function makeSessionError(sessionID?: string, error?: { name: string }): EventSessionError {
@@ -106,17 +114,17 @@ describe("session spans", () => {
     expect(tracer.spans[0]!.attributes["session.is_subagent"]).toBe(true)
   })
 
-  test("ends session span with OK status on session.idle", () => {
+  test("keeps session span open on session.idle", () => {
     const { ctx, tracer } = makeCtx()
     handleSessionCreated(makeSessionCreated("ses_1"), ctx)
     handleSessionIdle(makeSessionIdle("ses_1"), ctx)
     const span = tracer.spans[0]!
-    expect(span.ended).toBe(true)
-    expect(span.status.code).toBe(SpanStatusCode.OK)
-    expect(ctx.sessionSpans.has("ses_1")).toBe(false)
+    expect(span.ended).toBe(false)
+    expect(span.status.code).toBe(SpanStatusCode.UNSET)
+    expect(ctx.sessionSpans.has("ses_1")).toBe(true)
   })
 
-  test("sets session total attributes before ending on idle", () => {
+  test("sets session total attributes on idle without ending the span", () => {
     const { ctx, tracer } = makeCtx()
     handleSessionCreated(makeSessionCreated("ses_1"), ctx)
     ctx.sessionTotals.set("ses_1", { startMs: Date.now() - 100, tokens: 250, cost: 0.05, messages: 3, agent: "build" })
@@ -125,6 +133,17 @@ describe("session spans", () => {
     expect(span.attributes["session.total_tokens"]).toBe(250)
     expect(span.attributes["session.total_cost_usd"]).toBe(0.05)
     expect(span.attributes["session.total_messages"]).toBe(3)
+    expect(span.ended).toBe(false)
+  })
+
+  test("ends session span with OK status on session.deleted", () => {
+    const { ctx, tracer } = makeCtx()
+    handleSessionCreated(makeSessionCreated("ses_1"), ctx)
+    handleSessionDeleted(makeSessionDeleted("ses_1"), ctx)
+    const span = tracer.spans[0]!
+    expect(span.ended).toBe(true)
+    expect(span.status.code).toBe(SpanStatusCode.OK)
+    expect(ctx.sessionSpans.has("ses_1")).toBe(false)
   })
 
   test("ends session span with ERROR status on session.error", () => {
@@ -338,6 +357,16 @@ describe("message (LLM) spans", () => {
     const { ctx, tracer } = makeCtx()
     handleSessionCreated(makeSessionCreated("ses_1"), ctx)
     startMessageSpan("ses_1", "msg_1", "claude", "anthropic", 1000, ctx)
+    expect(tracer.spans).toHaveLength(2)
+    expect(tracer.spans[1]!.name).toBe("gen_ai.chat")
+    expect(tracer.spans[1]!.parentSpan).toBe(tracer.spans[0])
+  })
+
+  test("message spans after idle are still parented to the same session span", () => {
+    const { ctx, tracer } = makeCtx()
+    handleSessionCreated(makeSessionCreated("ses_1"), ctx)
+    handleSessionIdle(makeSessionIdle("ses_1"), ctx)
+    startMessageSpan("ses_1", "msg_2", "claude", "anthropic", 1500, ctx)
     expect(tracer.spans).toHaveLength(2)
     expect(tracer.spans[1]!.name).toBe("gen_ai.chat")
     expect(tracer.spans[1]!.parentSpan).toBe(tracer.spans[0])
